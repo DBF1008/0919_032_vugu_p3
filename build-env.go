@@ -32,6 +32,10 @@ type BuildEnv struct {
 	// components used so far in this build
 	compUsed map[CompKey]Builder
 
+	// components pulled from compCache via CachedComponent during this build but not
+	// yet handed to UseComponent; needed to restore the cache if the build panics
+	compTaken map[CompKey]Builder
+
 	// cache of build output by component from prior build pass
 	buildCache map[buildCacheKey]*BuildOut
 
@@ -44,8 +48,10 @@ type BuildEnv struct {
 	// track lifecycle callbacks
 	compStateMap map[Builder]compState
 
-	// used to determine "seen in this pass"
-	passNum uint8
+	// used to determine "seen in this pass"; uint64 means a wraparound is
+	// effectively impossible (a uint8 used to roll over after 256 builds and
+	// could cause live components to be treated as stale)
+	passNum uint64
 }
 
 // BuildResults contains the BuildOut values for full tree of components built.
@@ -71,6 +77,13 @@ func (e *BuildEnv) RunBuild(builder Builder) *BuildResults {
 	}
 	if e.compUsed == nil {
 		e.compUsed = make(map[CompKey]Builder)
+	}
+	if e.compTaken == nil {
+		e.compTaken = make(map[CompKey]Builder)
+	} else {
+		for k := range e.compTaken {
+			delete(e.compTaken, k)
+		}
 	}
 
 	// clear old prior build pass's cache
@@ -106,6 +119,28 @@ func (e *BuildEnv) RunBuild(builder Builder) *BuildResults {
 	buildIn.BuildEnv = e
 	// buildIn.PositionHashList starts empty
 
+	// If the build panics partway through, CachedComponent has already removed
+	// components from compCache and they may not have been registered with
+	// UseComponent yet. Put them (and any component never requested) into
+	// compUsed, so the next build reuses the prior pass instances instead of
+	// recreating them and losing their state. The panic itself is not
+	// recovered and continues to propagate to the caller.
+	panicked := true
+	defer func() {
+		if !panicked {
+			return
+		}
+		for k, c := range e.compTaken {
+			e.compUsed[k] = c
+		}
+		for k := range e.compTaken {
+			delete(e.compTaken, k)
+		}
+		for k, c := range e.compCache {
+			e.compUsed[k] = c
+		}
+	}()
+
 	// recursively build everything
 	e.buildOne(&buildIn, builder)
 
@@ -113,6 +148,8 @@ func (e *BuildEnv) RunBuild(builder Builder) *BuildResults {
 	if len(buildIn.PositionHashList) != 0 {
 		panic(fmt.Errorf("unexpected PositionHashList len = %d", len(buildIn.PositionHashList)))
 	}
+
+	panicked = false
 
 	// remove and invoke destroy on anything where passNum doesn't match
 	for k, st := range e.compStateMap {
@@ -126,6 +163,11 @@ func (e *BuildEnv) RunBuild(builder Builder) *BuildResults {
 }
 
 func (e *BuildEnv) buildOne(buildIn *BuildIn, thisb Builder) {
+
+	// inject anything registered via SetWireFunc; this also covers the root
+	// component and components supplied directly to RunBuild, which otherwise
+	// never pass through generated CachedComponent/UseComponent code
+	e.WireComponent(thisb)
 
 	st, ok := e.compStateMap[thisb]
 	if !ok {
@@ -179,6 +221,8 @@ func (e *BuildEnv) CachedComponent(compKey CompKey) Builder {
 	ret, ok := e.compCache[compKey]
 	if ok {
 		delete(e.compCache, compKey)
+		// remember this handout so a panic during the build can return it to the pool
+		e.compTaken[compKey] = ret
 		return ret
 	}
 	return nil
@@ -189,6 +233,7 @@ func (e *BuildEnv) CachedComponent(compKey CompKey) Builder {
 // which have be provided UseComponent() will be available via CachedComponent().
 func (e *BuildEnv) UseComponent(compKey CompKey, component Builder) {
 	delete(e.compCache, compKey)    // make sure it's not in the cache
+	delete(e.compTaken, compKey)    // and no longer pending (it is now committed)
 	e.compUsed[compKey] = component // make sure it is in the used
 }
 
@@ -223,7 +268,7 @@ func hashVals(vs ...uint64) uint64 {
 }
 
 type compState struct {
-	passNum uint8
+	passNum uint64
 	// TODO: flags?
 }
 
