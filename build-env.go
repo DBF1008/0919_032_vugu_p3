@@ -44,8 +44,11 @@ type BuildEnv struct {
 	// track lifecycle callbacks
 	compStateMap map[Builder]compState
 
-	// used to determine "seen in this pass"
-	passNum uint8
+	// used to determine "seen in this pass".
+	// uint64 is used so the value cannot realistically wrap around:
+	// a wrapping counter would match components that were visited in
+	// earlier passes and cause live components to be destroyed.
+	passNum uint64
 }
 
 // BuildResults contains the BuildOut values for full tree of components built.
@@ -106,6 +109,16 @@ func (e *BuildEnv) RunBuild(builder Builder) *BuildResults {
 	buildIn.BuildEnv = e
 	// buildIn.PositionHashList starts empty
 
+	// If the build panics, components that are still sitting unused in
+	// compCache must be carried over to compUsed, otherwise they are lost
+	// and would be needlessly recreated (with fresh state) on the next pass.
+	defer func() {
+		if r := recover(); r != nil {
+			e.preserveUnusedCache()
+			panic(r)
+		}
+	}()
+
 	// recursively build everything
 	e.buildOne(&buildIn, builder)
 
@@ -125,6 +138,19 @@ func (e *BuildEnv) RunBuild(builder Builder) *BuildResults {
 	return &BuildResults{allOut: e.buildResults, Out: e.buildResults[makeBuildCacheKey(builder)]}
 }
 
+// preserveUnusedCache moves every component that is still in compCache
+// over to compUsed.  It is invoked when a build pass does not complete so
+// that components not visited during the interrupted pass survive to be
+// cached again for the next pass instead of being dropped and recreated.
+func (e *BuildEnv) preserveUnusedCache() {
+	for k, c := range e.compCache {
+		if _, used := e.compUsed[k]; !used {
+			e.compUsed[k] = c
+		}
+		delete(e.compCache, k)
+	}
+}
+
 func (e *BuildEnv) buildOne(buildIn *BuildIn, thisb Builder) {
 
 	st, ok := e.compStateMap[thisb]
@@ -133,6 +159,10 @@ func (e *BuildEnv) buildOne(buildIn *BuildIn, thisb Builder) {
 	}
 	st.passNum = e.passNum
 	e.compStateMap[thisb] = st
+
+	// perform wire injection on every component built in this pass, not only
+	// on instances that happen to be freshly created by generated code
+	e.WireComponent(thisb)
 
 	beforeBuilder, ok := thisb.(BeforeBuilder)
 	if ok {
@@ -223,7 +253,7 @@ func hashVals(vs ...uint64) uint64 {
 }
 
 type compState struct {
-	passNum uint8
+	passNum uint64
 	// TODO: flags?
 }
 
